@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 import os
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 import streamlit as st
+from utils.sql_utility import no_specials
+from utils.streamlit_utility import in_streamlit
 
 import requests
 from dotenv import load_dotenv
@@ -39,8 +42,90 @@ class AddressLookupResult:
     error: str | None
     
     def valid(self):
-        return self.dpv_value == "Y"
+        return str(self.dpv_value).strip().upper() == "Y"
 
+
+state_acronyms = {
+    "AL":"Alabama",
+    "AK":"Alaska",
+    "AS":"American Samoa",
+    "AZ":"Arizona",
+    "AR":"Arkansas",
+    "CA":"California",
+    "CO":"Colorado",
+    "CT":"Connecticut",
+    "DE":"Delaware",
+    "DC":"District of Columbia",
+    "FM":"Federated States of Micronesia",
+    "FL":"Florida",
+    "GA":"Georgia",
+    "GU":"Guam",
+    "HI":"Hawaii",
+    "ID":"Idaho",
+    "IL":"Illinois",
+    "IN":"Indiana",
+    "IA":"Iowa",
+    "KS":"Kansas",
+    "KY":"Kentucky",
+    "LA":"Louisiana",
+    "ME":"Maine",
+    "MH":"Marshall Islands",
+    "MD":"Maryland",
+    "MA":"Massachusetts",
+    "MI":"Michigan",
+    "MN":"Minnesota",
+    "MS":"Mississippi",
+    "MO":"Missouri",
+    "MT":"Montana",
+    "NE":"Nebraska",
+    "NV":"Nevada",
+    "NH":"New Hampshire",
+    "NJ":"New Jersey",
+    "NM":"New Mexico",
+    "NY":"New York",
+    "NC":"North Carolina",
+    "ND":"North Dakota",
+    "MP":"Northern Mariana Islands",
+    "OH":"Ohio",
+    "OK":"Oklahoma",
+    "OR":"Oregon",
+    "PW":"Palau",
+    "PA":"Pennsylvania",
+    "PR":"Puerto Rico",
+    "RI":"Rhode Island",
+    "SC":"South Carolina",
+    "SD":"South Dakota",
+    "TN":"Tennessee",
+    "TX":"Texas",
+    "UT":"Utah",
+    "VT":"Vermont",
+    "VI":"Virgin Islands",
+    "VA":"Virginia",
+    "WA":"Washington",
+    "WV":"West Virginia",
+    "WI":"Wisconsin",
+    "WY":"Wyoming",
+    "AA":"Armed Forces Americas",
+    "AE":"Armed Forces Africa",
+    "AE":"Armed Forces Canada",
+    "AE":"Armed Forces Europe",
+    "AE":"Armed Forces Middle East",
+    "AP":"Armed Forces Pacific",
+}
+def valid_state(state_in: str) -> str:
+    state_in = no_specials(state_in.lower().strip())
+    sa_l = {no_specials(k.lower().strip()): no_specials(v.lower().strip()) for k, v in state_acronyms.items()}
+    if len(state_in) > 2:
+        # full state name passed
+        as_l = {v: k for k, v in sa_l.items()}
+        state = as_l.get(state_in, "")
+        return state.upper()
+    elif len(state_in) == 2:
+        # state acronym
+        state = sa_l.get(state_in, "")
+        return (state_in if state else state).upper()
+    return ""
+    
 
 def _get_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -86,6 +171,7 @@ def _find_first_matching_field(obj: Any) -> Tuple[Optional[str], Optional[str]]:
     Returns (path, value_as_string).
     """
     candidate_keys = {
+        "DPVConfirmation",
         "dpvConfirmationIndicator",
         "dpv_confirmation_indicator",
         "dpvIndicator",
@@ -171,7 +257,9 @@ def lookup_address(
     """
     token = get_oauth_token(timeout=timeout)
     
-    st.write(f"Lookup: {street=}, {city=}, {state=}, {zip_code=}, {secondary_address=}, {timeout=}")
+    state = valid_state(state)
+    
+    (st.write if in_streamlit() else print)(f"Lookup: {street=}, {city=}, {state=}, {zip_code=}, {secondary_address=}, {timeout=}")
 
     params: Dict[str, str] = {
         "streetAddress": street.strip(),
@@ -268,13 +356,98 @@ def lookup_address(
         raw_response=payload,
         error=None if exists else "USPS returned a successful response but no recognizable address fields were found.",
     )
+    
+    
+def parse_usps_result(result: Any) -> dict:
+    dpv = (getattr(result, "dpv_value", "") or "").strip().upper()
+    dpv_accessible = bool(getattr(result, "dpv_accessible", False))
+
+    if dpv_accessible:
+        exists = True if dpv == "Y" else False if dpv == "N" else None
+    else:
+        exists = None
+
+    return {
+        "ok": True,
+        "valid": bool(result.valid()),
+        "exists": exists,
+        "dpv_value": dpv or None,
+        "dpv_accessible": dpv_accessible,
+        "standardized_street": getattr(result, "standardized_street", None),
+        "standardized_city": getattr(result, "standardized_city", None),
+        "standardized_state": getattr(result, "standardized_state", None),
+        "zip5": getattr(result, "zip5", None),
+        "zip4": getattr(result, "zip4", None),
+        "error": getattr(result, "error", None),
+        "raw_response": getattr(result, "raw_response", None),
+    }
+    
+
+def parse_simple_address(full_address: str) -> dict[str, str]:
+    """
+    Best-effort parser for US-style addresses.
+    Expected rough input:
+        226300 Bluegill Ave, Schofield, WI 54476
+    """
+    out = {"street": "", "city": "", "state": "", "zip": ""}
+    if not full_address.strip():
+        (st.write if in_streamlit() else print)(f"A==\n\t{out=}")
+        return out
+
+    parts = [p.strip() for p in full_address.split(",")]
+    if len(parts) >= 1:
+        out["street"] = parts[0]
+
+    if len(parts) >= 2:
+        out["city"] = parts[1]
+
+    if len(parts) >= 3:
+        tail = " ".join(parts[2:]).replace(",", "")
+        m = re.match(r"([A-Za-z]{2})\s+(\d{5})", tail)
+        if m:
+            out["state"] = m.group(1)
+            out["zip"] = m.group(2)
+        else:
+            out["state"] = tail
+
+    out["state"] = valid_state(out["state"])
+    (st.write if in_streamlit() else print)(f"B==\n\t{out=}")
+    return out
 
 
 if __name__ == "__main__":
-    result = lookup_address(
-        street="133 Springhill Ave",
-        city="Bowling Green",
-        state="KY",
-        zip_code="42101",
-    )
-    print(asdict(result))
+    def test0():
+        a1 = dict(
+            street="133 Springhill Ave",
+            city="Bowling Green",
+            state="KY",
+            zip_code="42101"
+        )
+        a2 = dict(
+            street="3713 silver oak ct",
+            city="tulsa",
+            state="ok",
+            zip_code="74107"
+        )
+        a3 = dict(
+            street="379 us highway 285",
+            city="fairplay",
+            state="co",
+            zip_code="80440"
+        )
+        a4 = dict(
+            street="9201 huron st",
+            city="thornton",
+            state="co",
+            zip_code="80260"
+        )
+        for a in [a1, a2, a3, a4]:
+            result = lookup_address(**a)
+            print(f"\t==>{result.valid()}")
+            print(asdict(result))
+            
+    def test1():
+        a1 = "133 springhill ave., bowling green, ky, 42101"
+        print(parse_simple_address(a1))
+        
+    test1()

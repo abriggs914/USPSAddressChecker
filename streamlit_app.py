@@ -1,1477 +1,832 @@
-"""
-TELUS Maps Analyst – Interactive Study Aid
-==========================================
-Run locally:
-    pip install streamlit folium streamlit-folium geopy
-    streamlit run telus_map_tool.py
+# streamlit_app.py
+from __future__ import annotations
 
-No API key required — blurb generation runs entirely on local rule logic.
-"""
-
-import re
 import math
-import urllib.parse
+import re
+from typing import Optional
+from dataclasses import asdict
+
+import pandas as pd
 import streamlit as st
 import folium
-from typing import Optional
-from usps_api import USPSApiError, lookup_address
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut
 
+from usps_api import lookup_address, USPSApiError, parse_simple_address
+from utils.location_utility import geocode_address, resolve_location
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+from rating_engine import (
+    QueryContext,
+    ResultInput,
+    AssumptionFlag,
+    score_result,
+    get_chain_locator,
+    google_maps_link,
+    google_maps_address_link,
+    bing_maps_link,
+    bing_maps_address_link,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config & styles
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="TELUS Maps Study Aid",
+    page_title="Maps Search Rating Sandbox",
     page_icon="🗺️",
     layout="wide",
-    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+        /* General */
+        .small-muted  { color: #64748b; font-size: 16px; }
+        .code-ish     { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                        font-size: 18px; }
+
+        /* Decision summary card */
+        .decision-box {
+            border: 1px solid #dbeafe;
+            background: #606060;
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 12px;
+        }
+
+        /* Blurb / comment */
+        .blurb-box {
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            padding: 14px;
+            background: #606060;
+            white-space: pre-wrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 18px;
+        }
+
+        /* Assumption flag cards */
+        .flag-error   { border-left: 4px solid #ef4444; background: #606060;
+                        border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+        .flag-warning { border-left: 4px solid #f59e0b; background: #606060;
+                        border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+        .flag-info    { border-left: 4px solid #3b82f6; background: #606060;
+                        border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+        .flag-field   { font-weight: 700; font-size: 18px; margin-bottom: 3px; }
+        .flag-msg     { font-size: 18px; margin-bottom: 5px; }
+        .flag-action  { font-size: 16px; color: #cbdef3; white-space: pre-wrap; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
-# ─── Custom CSS ───────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;600;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    code, .mono { font-family: 'DM Mono', monospace; }
-    .stApp { background: #0a0f1e; color: #e2e8f0; }
-    section[data-testid="stSidebar"] { background: #0d1424 !important; border-right: 1px solid #1a2540; }
-    h1, h2, h3 { color: #f1f5f9 !important; }
-    .block-container { padding-top: 1.5rem; }
-
-    /* Cards */
-    .card {
-        background: #111827;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 16px 18px;
-        margin-bottom: 14px;
-    }
-    .card-title {
-        font-size: 10px;
-        font-weight: 700;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: #475569;
-        margin-bottom: 8px;
-    }
-
-    /* Tags */
-    .tag {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 20px;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        margin-right: 6px;
-        margin-bottom: 4px;
-    }
-    .tag-blue  { background: #1e3a5f33; color: #60a5fa; border: 1px solid #1e3a5f; }
-    .tag-green { background: #14532d33; color: #4ade80; border: 1px solid #14532d; }
-    .tag-red   { background: #7f1d1d33; color: #f87171; border: 1px solid #7f1d1d; }
-    .tag-amber { background: #78350f33; color: #fbbf24; border: 1px solid #78350f; }
-    .tag-purple{ background: #312e8133; color: #a5b4fc; border: 1px solid #312e81; }
-
-    /* Link buttons */
-    .link-btn {
-        display: inline-block;
-        padding: 5px 13px;
-        border-radius: 6px;
-        background: #1e293b;
-        border: 1px solid #2a3650;
-        color: #94a3b8 !important;
-        font-size: 12px;
-        font-weight: 600;
-        text-decoration: none !important;
-        margin-right: 6px;
-        margin-bottom: 6px;
-        transition: background 0.15s;
-    }
-    .link-btn:hover { background: #2a3650; color: #e2e8f0 !important; }
-    .link-btn-primary { background: #1e3a5f; border-color: #2563eb; color: #60a5fa !important; }
-    .link-btn-warn    { background: #1c0a0a; border-color: #dc2626; color: #f87171 !important; }
-    .link-btn-green   { background: #052e16; border-color: #16a34a; color: #4ade80 !important; }
-
-    /* Distance pill */
-    .dist-good   { color: #4ade80; font-weight: 700; }
-    .dist-warn   { color: #fbbf24; font-weight: 700; }
-    .dist-bad    { color: #f87171; font-weight: 700; }
-
-    /* Context blurb */
-    .blurb-box {
-        background: #090e1c;
-        border: 1px solid #1e3a5f;
-        border-radius: 8px;
-        padding: 14px 16px;
-        font-size: 13px;
-        line-height: 1.7;
-        color: #93c5fd;
-        white-space: pre-wrap;
-        font-family: 'DM Mono', monospace;
-    }
-    .warn-box {
-        background: #1c0a0a;
-        border: 1px solid #7f1d1d;
-        border-radius: 8px;
-        padding: 10px 14px;
-        font-size: 13px;
-        color: #fca5a5;
-        margin-bottom: 8px;
-    }
-</style>
-""", unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility helpers
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_geolocator() -> Nominatim:
+    return Nominatim(user_agent="maps_search_rating_sandbox")
 
 
-# ─── Geocoder ─────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def geocode_address(address: str):
-    """Return (lat, lon, display_name) or None."""
-    try:
-        geolocator = Nominatim(user_agent="telus_maps_study_aid_v1")
-        loc = geolocator.geocode(address, timeout=8)
-        if loc:
-            return loc.latitude, loc.longitude, loc.address
-    except GeocoderTimedOut:
-        pass
-    return None
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-def km_to_miles(km):
-    return km * 0.621371
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return r * 2 * math.asin(math.sqrt(a))
 
 
-ABBREV_MAP = {
-    "ST": "STREET", "STREET": "STREET",
-    "RD": "ROAD", "ROAD": "ROAD",
-    "AVE": "AVENUE", "AV": "AVENUE", "AVENUE": "AVENUE",
-    "BLVD": "BOULEVARD", "BOULEVARD": "BOULEVARD",
-    "DR": "DRIVE", "DRIVE": "DRIVE",
-    "LN": "LANE", "LANE": "LANE",
-    "CT": "COURT", "COURT": "COURT",
-    "PL": "PLACE", "PLACE": "PLACE",
-    "TER": "TERRACE", "TERRACE": "TERRACE",
-    "PKWY": "PARKWAY", "PARKWAY": "PARKWAY",
-    "N": "NORTH", "S": "SOUTH", "E": "EAST", "W": "WEST",
-    "NE": "NORTHEAST", "NW": "NORTHWEST", "SE": "SOUTHEAST", "SW": "SOUTHWEST",
-}
+def format_bool(v: Optional[bool]) -> str:
+    if v is True:   return "✅ Yes"
+    if v is False:  return "❌ No"
+    return "❔ Unknown"
 
 
-def clean_text(value: Optional[str]) -> str:
-    value = str(value or "").upper().strip()
-    value = re.sub(r"[^\w\s]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+def result_status_from_ui(raw: str) -> str:
+    s = (raw or "OPEN").strip().upper()
+    return s if s in {"OPEN", "CLOSED", "PERMANENT_CLOSURE", "UNKNOWN"} else "UNKNOWN"
 
 
-def normalize_tokens(value: Optional[str]) -> list[str]:
-    cleaned = clean_text(value)
-    if not cleaned:
-        return []
-    return [ABBREV_MAP.get(tok, tok) for tok in cleaned.split()]
+# ─────────────────────────────────────────────────────────────────────────────
+# USPS helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _assess_address_match(
+    input_addr: str, usps_street: str,
+    input_city: str,  usps_city: str,
+    input_state: str, usps_state: str,
+    input_zip: str,   usps_zip5: str,
+) -> dict:
+    def nk(s: str) -> str:
+        s = (s or "").strip().lower()
+        return re.sub(r"\s+", " ", s.replace(".", "").replace(",", ""))
 
+    if (
+        nk(input_addr) == nk(usps_street)
+        and nk(input_city) == nk(usps_city)
+        and nk(input_state) == nk(usps_state)
+        and (not input_zip or nk(input_zip) == nk(usps_zip5))
+    ):
+        return {"status": "Exact normalized match", "notes": []}
 
-def assess_address_match(input_addr: str, usps_street: str, input_city: str, usps_city: str,
-                         input_state: str, usps_state: str, input_zip: str, usps_zip5: str) -> dict:
-    input_addr_toks = normalize_tokens(input_addr)
-    usps_addr_toks = normalize_tokens(usps_street)
+    if nk(input_city) == nk(usps_city) and nk(input_state) == nk(usps_state) and usps_street:
+        return {"status": "Close match", "notes": ["USPS standardized the street line."]}
 
-    input_city_toks = normalize_tokens(input_city)
-    usps_city_toks = normalize_tokens(usps_city)
-
-    street_exact = input_addr_toks == usps_addr_toks
-    street_loose = "".join(input_addr_toks) == "".join(usps_addr_toks)
-
-    city_exact = input_city_toks == usps_city_toks
-    city_loose = "".join(input_city_toks) == "".join(usps_city_toks)
-
-    state_match = clean_text(input_state) == clean_text(usps_state)
-    zip_match = (not clean_text(input_zip)) or clean_text(input_zip) == clean_text(usps_zip5)
-
-    notes = []
-    if street_exact:
-        notes.append("Street matches USPS after normalization.")
-    elif street_loose:
-        notes.append("Street appears equivalent after abbreviation / spacing normalization.")
-    else:
-        notes.append("Street differs from USPS-standardized result.")
-
-    if city_exact:
-        notes.append("City matches USPS after normalization.")
-    elif city_loose:
-        notes.append("City appears equivalent after spacing normalization.")
-    else:
-        notes.append("City differs from USPS-standardized result.")
-
-    notes.append("State matches USPS." if state_match else "State differs from USPS.")
-    if input_zip:
-        notes.append("ZIP5 matches USPS." if zip_match else "ZIP5 differs from USPS.")
-
-    if street_exact and city_exact and state_match and zip_match:
-        status = "Exact normalized match"
-    elif street_loose and city_loose and state_match and zip_match:
-        status = "Equivalent match"
-    elif (street_loose or street_exact) and (city_loose or city_exact) and state_match:
-        status = "Close match"
-    else:
-        status = "Returned USPS address differs"
-
-    return {"status": status, "notes": notes}
+    return {"status": "Mismatch", "notes": ["Input address differs from USPS normalized form."]}
 
 
 @st.cache_data(show_spinner=False)
-def verify_address_with_usps(street: str, city: str, state: str, zip_code: str = "", secondary: str = "") -> dict:
+def verify_address_with_usps(
+    street: str, city: str, state: str,
+    zip_code: str = "", secondary: str = "",
+) -> dict:
+    EMPTY: dict = {
+        "ok": False, "valid": False, "exists": None,
+        "dpv_value": None, "dpv_accessible": False,
+        "standardized_street": None, "standardized_city": None,
+        "standardized_state": None, "zip5": None, "zip4": None,
+        "match_status": "", "match_notes": [], "error": None, "raw_response": {},
+    }
     try:
-        st.write("-A")
-        st.write("-B")
-        st.write("-C")
-        st.write("-D:")
         result = lookup_address(
-            street=street,
-            city=city,
-            state=state,
+            street=street, city=city, state=state,
             zip_code=zip_code or None,
             secondary_address=secondary or None,
         )
-        st.write("-E")
-        st.write(result.__dict__)
-        
+        dpv = (getattr(result, "dpv_value", "") or "").strip().upper()
+        dpv_accessible = bool(getattr(result, "dpv_accessible", False))
+        exists = (True if dpv == "Y" else False if dpv == "N" else None) if dpv_accessible else None
 
-        # Requested logic:
-        # DPV == Y => exists
-        # DPV == N => does not exist
-        # anything else => unknown unless you explicitly decide otherwise
-        dpv = (result.dpv_value or "").strip().upper()
-        if result.dpv_accessible:
-            if dpv == "Y":
-                address_exists = True
-            elif dpv == "N":
-                address_exists = False
-            else:
-                address_exists = None
-        else:
-            address_exists = None
+        match_info = _assess_address_match(
+            street, getattr(result, "standardized_street", "") or "",
+            city,   getattr(result, "standardized_city",  "") or "",
+            state,  getattr(result, "standardized_state", "") or "",
+            zip_code or "", getattr(result, "zip5", "") or "",
+        )
+        return {
+            "ok": True, "valid": bool(result.valid()), "exists": exists,
+            "dpv_value": dpv or None, "dpv_accessible": dpv_accessible,
+            "standardized_street": getattr(result, "standardized_street", None),
+            "standardized_city":   getattr(result, "standardized_city",   None),
+            "standardized_state":  getattr(result, "standardized_state",  None),
+            "zip5": getattr(result, "zip5", None), "zip4": getattr(result, "zip4", None),
+            "match_status": match_info["status"], "match_notes": match_info["notes"],
+            "error": getattr(result, "error", None),
+            "raw_response": getattr(result, "raw_response", {}),
+        }
+    except Exception as exc:
+        st.error(f"USPS API error: {exc}")
+        return {**EMPTY, "error": str(exc)}
 
-        match_info = assess_address_match(
-            input_addr=result.input_street,
-            usps_street=result.standardized_street or "",
-            input_city=result.input_city,
-            usps_city=result.standardized_city or "",
-            input_state=result.input_state,
-            usps_state=result.standardized_state or "",
-            input_zip=result.input_zip or "",
-            usps_zip5=result.zip5 or "",
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def render_location_links(
+    title: str, lat: Optional[float], lon: Optional[float], address: str = ""
+) -> None:
+    st.markdown(f"**{title} Links**")
+    cols = st.columns(4)
+    if lat is not None and lon is not None:
+        cols[0].markdown(f"[Google Maps (coord)]({google_maps_link(lat, lon)})")
+        cols[1].markdown(f"[Bing Maps (coord)]({bing_maps_link(lat, lon)})")
+    else:
+        cols[0].markdown("_Google coord unavailable_")
+        cols[1].markdown("_Bing coord unavailable_")
+    if address.strip():
+        cols[2].markdown(f"[Google Maps (addr)]({google_maps_address_link(address)})")
+        cols[3].markdown(f"[Bing Maps (addr)]({bing_maps_address_link(address)})")
+    else:
+        cols[2].markdown("_Google addr unavailable_")
+        cols[3].markdown("_Bing addr unavailable_")
+
+
+def render_assumption_flags(flags: list[AssumptionFlag]) -> None:
+    """Render assumption flags as a prioritised checklist."""
+    if not flags:
+        st.success("✅ No open assumptions — all required inputs are present.")
+        return
+
+    errors   = [f for f in flags if f.severity == "error"]
+    warnings = [f for f in flags if f.severity == "warning"]
+    infos    = [f for f in flags if f.severity == "info"]
+
+    total = len(flags)
+    e, w, i = len(errors), len(warnings), len(infos)
+    st.markdown(
+        f"**{total} assumption(s) to investigate:** "
+        f"🔴 {e} must-verify &nbsp;|&nbsp; 🟡 {w} check &nbsp;|&nbsp; 🔵 {i} FYI"
+    )
+
+    for flag in errors + warnings + infos:
+        cls = {"error": "flag-error", "warning": "flag-warning", "info": "flag-info"}[flag.severity]
+        icon = {"error": "🔴", "warning": "🟡", "info": "🔵"}[flag.severity]
+        st.markdown(
+            f"""
+            <div class="{cls}">
+                <div class="flag-field">{icon} {flag.field}</div>
+                <div class="flag-msg">{flag.message}</div>
+                <div class="flag-action">{flag.action}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        return {
-            "ok": True,
-            "valid": result.valid(),
-            "exists": address_exists,
-            "dpv_value": result.dpv_value,
-            "dpv_accessible": result.dpv_accessible,
-            "dpv_field_path": result.dpv_field_path,
-            "standardized_street": result.standardized_street,
-            "standardized_city": result.standardized_city,
-            "standardized_state": result.standardized_state,
-            "zip5": result.zip5,
-            "zip4": result.zip4,
-            "delivery_point_zip": result.delivery_point_zip,
-            "match_status": match_info["status"],
-            "match_notes": match_info["notes"],
-            "error": result.error,
-            "raw_response": result.raw_response,
-        }
 
-    except USPSApiError as e:
-        return {
-            "ok": False,
-            "exists": None,
-            "dpv_value": None,
-            "dpv_accessible": False,
-            "dpv_field_path": None,
-            "standardized_street": None,
-            "standardized_city": None,
-            "standardized_state": None,
-            "zip5": None,
-            "zip4": None,
-            "delivery_point_zip": None,
-            "match_status": "USPS API error",
-            "match_notes": [],
-            "error": str(e),
-            "raw_response": {},
-        }
+def _relevance_badge(r: str) -> str:
+    colors = {
+        "Navigational": "#1d4ed8",
+        "Excellent":    "#15803d",
+        "Good":         "#0e7490",
+        "Acceptable":   "#d97706",
+        "Bad":          "#dc2626",
+    }
+    c = colors.get(r, "#64748b")
+    return (
+        f'<span style="background:{c};color:#777;padding:2px 10px;'
+        f'border-radius:6px;font-weight:700;font-size:18px">{r}</span>'
+    )
 
 
-# ─── Known chain locator URLs ─────────────────────────────────────────────────
-CHAIN_LOCATORS = {
-    # Fast food
-    "mcdonald's": "https://www.mcdonalds.com/us/en-us/restaurant-locator.html",
-    "mcdonalds":  "https://www.mcdonalds.com/us/en-us/restaurant-locator.html",
-    "burger king":"https://www.burgerking.com/store-locator",
-    "kfc":        "https://www.kfc.com/find-a-kfc",
-    "taco bell":  "https://www.tacobell.com/find-a-taco-bell",
-    "wendy's":    "https://www.wendys.com/restaurant-locator",
-    "wendys":     "https://www.wendys.com/restaurant-locator",
-    "subway":     "https://www.subway.com/en-US/FindASubway",
-    "chick-fil-a":"https://www.chick-fil-a.com/locations",
-    "chickfila":  "https://www.chick-fil-a.com/locations",
-    "chick fil a":"https://www.chick-fil-a.com/locations",
-    "whataburger":"https://whataburger.com/locations",
-    "popeyes":    "https://www.popeyes.com/store-locator",
-    "five guys":  "https://www.fiveguys.com/locations",
-    "in-n-out":   "https://www.in-n-out.com/locations",
-    "in n out":   "https://www.in-n-out.com/locations",
-    "sonic":      "https://www.sonicdrivein.com/locations",
-    "dairy queen":"https://www.dairyqueen.com/en-us/locator/",
-    "jack in the box": "https://www.jackinthebox.com/locations",
-    "hardee's":   "https://www.hardees.com/locations",
-    "hardees":    "https://www.hardees.com/locations",
-    "carl's jr":  "https://www.carlsjr.com/locations",
-    "carls jr":   "https://www.carlsjr.com/locations",
-    "arbys":      "https://arbys.com/locations",
-    "arby's":     "https://arbys.com/locations",
-    "panera":     "https://www.panerabread.com/en-us/cafe-locator.html",
-    "panera bread":"https://www.panerabread.com/en-us/cafe-locator.html",
-    "chipotle":   "https://www.chipotle.com/order",
-    "domino's":   "https://www.dominos.com/en/pages/locator/",
-    "dominos":    "https://www.dominos.com/en/pages/locator/",
-    "pizza hut":  "https://www.pizzahut.com/locator",
-    "papa john's":"https://www.papajohns.com/order/store-finder",
-    "papa johns": "https://www.papajohns.com/order/store-finder",
-    "little caesars": "https://littlecaesars.com/en-us/store-locator/",
-    "dunkin":     "https://www.dunkindonuts.com/en/locations",
-    "dunkin donuts": "https://www.dunkindonuts.com/en/locations",
-    "starbucks":  "https://www.starbucks.com/store-locator",
-    "tim hortons":"https://www.timhortons.com/store-locator",
-    "panda express": "https://www.pandaexpress.com/locations",
-    "raising cane's": "https://www.raisingcanes.com/locations",
-    "wingstop":   "https://www.wingstop.com/order",
-    "freddy's":   "https://www.freddysusa.com/locations/",
-    "freddys":    "https://www.freddysusa.com/locations/",
+def decision_to_blurb(result_name: str, decision, query: str = "") -> str:
+    """Generate a concise comment suitable for pasting into TryRating."""
+    lines = [
+        f"Navigational result for query: {'Yes' if decision.has_navigational_result else 'No'}",
+    ]
+    if decision.unexpected_language_or_script:
+        lines.append("⚠ Result name/title is in unexpected language or script — all other ratings N/A.")
+        return "\n".join(lines)
 
-    # Retail
-    "walmart":    "https://www.walmart.com/store/finder",
-    "target":     "https://www.target.com/store-locator/find-stores",
-    "costco":     "https://www.costco.com/warehouse-locations",
-    "home depot": "https://www.homedepot.com/l/storelocator",
-    "lowe's":     "https://www.lowes.com/store",
-    "lowes":      "https://www.lowes.com/store",
-    "best buy":   "https://www.bestbuy.com/site/store-locator/store-finder",
-    "walgreens":  "https://www.walgreens.com/storelocator/find.jsp",
-    "cvs":        "https://www.cvs.com/store-locator/landing",
-    "rite aid":   "https://www.riteaid.com/locations",
-    "dollar tree":"https://www.dollartree.com/locations/index",
-    "dollar general": "https://www.dollargeneral.com/store-directory",
-    "family dollar": "https://stores.familydollar.com/",
-    "tj maxx":    "https://tjmaxx.tjx.com/store-locator",
-    "marshalls":  "https://www.marshalls.com/us/store/index.jsp",
-    "ross":       "https://www.rossstores.com/store-finder",
-    "whole foods":"https://www.wholefoodsmarket.com/stores",
-    "trader joe's": "https://www.traderjoes.com/home/stores",
-    "trader joes":"https://www.traderjoes.com/home/stores",
-    "aldi":       "https://stores.aldi.us/",
-    "kroger":     "https://www.kroger.com/stores/search",
-    "safeway":    "https://www.safeway.com/stores/grocery-stores-near-me.html",
-    "publix":     "https://www.publix.com/locations",
-    "meijer":     "https://www.meijer.com/shopping/store-locator.html",
-    "sam's club": "https://www.samsclub.com/club-finder",
+    if decision.business_closed_or_dne:
+        lines.append("Business/POI closed or does not exist — relevance rated as if open (§4.2).")
 
-    # Fuel / Convenience
-    "shell":      "https://www.shell.com/motorists/shell-station-locator.html",
-    "chevron":    "https://www.chevronwithtechron.com/en_us/home/find-a-station.html",
-    "bp":         "https://www.bp.com/en_us/united-states/home/find-a-gas-station.html",
-    "exxon":      "https://www.exxon.com/en/find-station",
-    "mobil":      "https://www.mobil.com/en/find-station",
-    "7-eleven":   "https://www.7-eleven.com/en/store-locator",
-    "7 eleven":   "https://www.7-eleven.com/en/store-locator",
-    "circle k":   "https://www.circlek.com/find-a-store",
-    "speedway":   "https://www.speedway.com/storelocator",
+    rel_line = f"Relevance: {decision.relevance}"
+    if decision.demotion_reasons:
+        rel_line += f" [{', '.join(decision.demotion_reasons)}]"
+    lines.append(rel_line)
 
-    # Hotels
-    "marriott":   "https://www.marriott.com/find-hotels/findHotels.mi",
-    "hilton":     "https://www.hilton.com/en/locations/",
-    "holiday inn":"https://www.ihg.com/holidayinn/hotels/us/en/find-hotels/hotel/list",
-    "hampton inn":"https://www.hilton.com/en/hampton/",
-    "hyatt":      "https://www.hyatt.com/find-a-hotel",
-    "best western": "https://www.bestwestern.com/en_US/find-a-hotel.html",
-    "motel 6":    "https://www.motel6.com/en/home/find-a-motel.html",
+    if decision.relevance_notes:
+        lines.extend(decision.relevance_notes)
 
-    # Banks
-    "chase":      "https://locator.chase.com/",
-    "bank of america": "https://www.bankofamerica.com/banking-centers-atms/",
-    "wells fargo":"https://www.wellsfargo.com/locator/",
-    "citibank":   "https://online.citi.com/US/JRS/portal/template.do?ID=ATMBranchLocator",
-    "td bank":    "https://www.td.com/us/en/personal-banking/locations/",
-    "us bank":    "https://www.usbank.com/bank-accounts/locations.html",
+    lines.append(f"Name Accuracy: {decision.name_rating}")
+    lines.append(f"Address Accuracy: {decision.address_rating}")
+    if decision.address_issues:
+        lines.append(f"  Issues: {', '.join(decision.address_issues)}")
+    lines.append(f"Pin Accuracy: {decision.pin_rating}")
 
-    # Others
-    "ups store":  "https://www.theupsstore.com/tools/find-a-store",
-    "fedex":      "https://local.fedex.com/",
-    "usps":       "https://tools.usps.com/find-location.htm",
-    "planet fitness": "https://www.planetfitness.com/gyms",
-    "la fitness": "https://www.lafitness.com/pages/clublocator.aspx",
-    "anytime fitness": "https://www.anytimefitness.com/gyms/",
-    "autozone":   "https://www.autozone.com/locations",
-    "o'reilly":   "https://www.oreillyauto.com/store-locator",
-    "oreilly":    "https://www.oreillyauto.com/store-locator",
-    "advance auto parts": "https://shop.advanceautoparts.com/o/store-locator",
-    "jiffy lube": "https://www.jiffylube.com/locations",
-    "valvoline":  "https://www.vioc.com/locations",
+    lines.append("")
+    lines.append(decision.comment)
 
-    # Transit / Transport
-    "amtrak":     "https://www.amtrak.com/find-a-station",
-    "greyhound":  "https://www.greyhound.com/en/locations",
-}
+    return "\n".join(lines)
 
 
-CLASSIFICATION_KEYWORDS = {
-    "pizza":        ["pizza", "italian", "pasta"],
-    "burger":       ["burger", "fast food", "american food"],
-    "mexican":      ["mexican", "taco", "burrito", "tex-mex"],
-    "chinese":      ["chinese", "asian", "dim sum"],
-    "gas station":  ["gas", "fuel", "petrol", "station", "shell", "chevron", "bp", "exxon"],
-    "grocery":      ["grocery", "supermarket", "food store", "market"],
-    "pharmacy":     ["pharmacy", "drug store", "walgreens", "cvs", "rite aid"],
-    "hotel":        ["hotel", "motel", "inn", "lodging", "marriott", "hilton"],
-    "bank":         ["bank", "atm", "financial", "chase", "wells fargo"],
-    "airport":      ["airport", "terminal", "aviation", "airfield"],
-    "mall":         ["mall", "shopping center", "plaza", "outlet"],
-    "hospital":     ["hospital", "medical center", "health", "clinic"],
-    "transit":      ["station", "transit", "subway", "metro", "bus terminal", "train"],
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Map helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def add_viewport_rectangle(
+    m, center_lat: float, center_lon: float,
+    width_m: int = 3500, height_m: int = 5000,
+    color: str = "#3b82f6",
+) -> dict:
+    lat_deg_per_m = 1 / 111_320
+    lon_deg_per_m = 1 / (111_320 * math.cos(math.radians(center_lat)))
+    half_h = (height_m / 2) * lat_deg_per_m
+    half_w = (width_m  / 2) * lon_deg_per_m
+    south, north = center_lat - half_h, center_lat + half_h
+    west,  east  = center_lon - half_w, center_lon + half_w
+    folium.Rectangle(
+        bounds=[[south, west], [north, east]],
+        color=color, weight=2,
+        fill=True, fill_color=color, fill_opacity=0.14,
+        tooltip="Viewport Bounds",
+    ).add_to(m)
+    return dict(south=south, north=north, west=west, east=east)
 
 
-QUERY_TYPE_HINTS = {
-    "Specific Address": [r"\b\d+\s+\w+"],
-    "Chain + Nearby Modifier": [r"\bnear me\b", r"\bnearest\b", r"\bnearby\b"],
-    "Locality Query": [r"\b(city|town|village|county|state|province)\b"],
-    "Transit Query": [r"\bstation\b", r"\bterminal\b", r"\bairport\b", r"\bmetro\b", r"\bsubway\b"],
-}
+def point_in_bbox(
+    lat: Optional[float], lon: Optional[float],
+    south: float, north: float, west: float, east: float,
+) -> Optional[bool]:
+    if lat is None or lon is None:
+        return None
+    return south <= lat <= north and west <= lon <= east
 
 
-LOCATION_MODIFIER_WORDS = {"in", "at", "near", "around", "within"}
-NEARBY_WORDS = {"near me", "nearest", "nearby", "closest"}
+def build_result_input_from_ui(d: dict) -> ResultInput:
+    return ResultInput(
+        name=d["name"],
+        address=d["address"],
+        classification=d["classification"],
+        result_type=d["result_type"],
+        status=result_status_from_ui(d["status"]),
+        distance_to_user_km=d.get("distance_to_user_km"),
+        distance_to_viewport_km=d.get("distance_to_viewport_km"),
+        lat=d.get("resolved_lat"),
+        lon=d.get("resolved_lon"),
+        official_name=d.get("official_name", ""),
+        official_address=d.get("official_address", ""),
+        usps_valid=d.get("usps", {}).get("ok"),
+        usps_exists=d.get("usps", {}).get("exists"),
+        usps_match_status=d.get("usps", {}).get("match_status", ""),
+        usps_match_notes=d.get("usps", {}).get("match_notes", []),
+        pin_same_property=d.get("pin_same_property"),
+        pin_same_block=d.get("pin_same_block"),
+        pin_adjacent_property=d.get("pin_adjacent_property"),
+        pin_precise=d.get("pin_precise"),
+        pin_boundary_identifiable=d.get("pin_boundary_identifiable"),
+    )
 
 
-def infer_query_metadata(query: str) -> dict:
-    q = (query or "").strip()
-    q_lower = q.lower()
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar inputs
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("🧩 Query Inputs")
 
-    nearby_modifier = any(phrase in q_lower for phrase in NEARBY_WORDS)
+    query        = st.text_input("Query", placeholder="e.g. Starbucks")
+    viewport_age = st.selectbox("Viewport Age", ["FRESH", "STALE"], index=0)
+    locale       = st.text_input("Locale",  value="en_US")
+    country      = st.text_input("Country", value="United States")
 
-    tokens = re.findall(r"[a-zA-Z0-9']+", q_lower)
-    loc_modifier = any(tok in LOCATION_MODIFIER_WORDS for tok in tokens) and not nearby_modifier
+    st.divider()
+    st.subheader("📺 Viewport")
+    vp_mode    = st.radio("Viewport Input Mode", ["Address", "Lat/Lon"], horizontal=True, key="vp_mode")
+    vp_address = vp_lat = vp_lon = ""
+    if vp_mode == "Address":
+        vp_address = st.text_input("Viewport Address / Place", key="vp_address")
+    else:
+        vp_lat = st.text_input("Viewport Lat", key="vp_lat")
+        vp_lon = st.text_input("Viewport Lon", key="vp_lon")
 
-    inferred_chain = None
-    for key in CHAIN_LOCATORS:
-        if key in q_lower:
-            inferred_chain = key
-            break
+    st.markdown("##### Viewport Rectangle Size")
+    vp_width_m  = st.slider("Width (m)",  250, 100_000,  3_500, 250)
+    vp_height_m = st.slider("Height (m)", 250, 100_000,  5_000, 250)
 
-    inferred_classification = None
-    for cls, keywords in CLASSIFICATION_KEYWORDS.items():
-        if any(k in q_lower for k in keywords):
-            inferred_classification = cls
-            break
+    st.divider()
+    st.subheader("👤 User")
+    user_mode    = st.radio("User Input Mode", ["Address", "Lat/Lon"], horizontal=True, key="user_mode")
+    user_address = user_lat = user_lon = ""
+    if user_mode == "Address":
+        user_address = st.text_input("User Address / Place", key="user_address")
+    else:
+        user_lat = st.text_input("User Lat", key="user_lat")
+        user_lon = st.text_input("User Lon", key="user_lon")
 
-    inferred_type = "Chain Business"
-    if re.search(r"\b\d+\s+[a-z]", q_lower):
-        inferred_type = "Specific Address"
-    elif nearby_modifier:
-        inferred_type = "Chain + Nearby Modifier"
-    elif inferred_chain and loc_modifier:
-        inferred_type = "Chain + Location Modifier"
-    elif any(term in q_lower for term in ["station", "airport", "terminal", "metro", "subway"]):
-        inferred_type = "Transit Query"
-    elif any(term in q_lower for term in ["mall", "shopping center", "hospital", "bank", "hotel", "gas", "pharmacy"]):
-        inferred_type = "Category Query"
-
-    return {
-        "nearby_modifier": nearby_modifier,
-        "loc_modifier": loc_modifier,
-        "chain": inferred_chain,
-        "classification": inferred_classification,
-        "query_type": inferred_type,
+    st.divider()
+    user_inside_viewport_label = st.radio(
+        "User position relative to viewport",
+        ["Inside FVP", "Outside FVP", "Unknown / N/A"],
+        index=2,
+    )
+    user_inside_viewport_map = {
+        "Inside FVP":     True,
+        "Outside FVP":    False,
+        "Unknown / N/A":  None,
     }
 
-
-def detect_classification_issue(query: str, classification: str) -> str | None:
-    """Return warning string if classification seems inconsistent with query."""
-    q_lower = query.lower()
-    c_lower = classification.lower()
-    for cat, keywords in CLASSIFICATION_KEYWORDS.items():
-        # Does classification match a category?
-        if any(k in c_lower for k in keywords):
-            # Does the query strongly imply a different category?
-            for other_cat, other_kw in CLASSIFICATION_KEYWORDS.items():
-                if other_cat != cat and any(k in q_lower for k in other_kw):
-                    return f"Query suggests **{other_cat}** but classification is **{cat}** — possible mismatch (Section 6.3.2)"
-    return None
-
-
-def get_chain_locator(query: str) -> tuple[str | None, bool]:
-    """Return (url, found) for the query chain."""
-    q = query.lower().strip()
-    # Try exact match first
-    if q in CHAIN_LOCATORS:
-        return CHAIN_LOCATORS[q], True
-    # Try substring match
-    for key, url in CHAIN_LOCATORS.items():
-        if key in q or q in key:
-            return url, True
-    # Build a Google search fallback
-    encoded = urllib.parse.quote(f"{query} store locator official site")
-    return f"https://www.google.com/search?q={encoded}", False
-
-
-def google_maps_link(lat: float, lon: float, label: str = "") -> str:
-    return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-
-
-def google_maps_address_link(address: str) -> str:
-    return f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(address)}"
-
-
-def usps_link(address: str) -> str:
-    """Fallback public USPS page, used only as a manual backup."""
-    return "https://tools.usps.com/zip-code-lookup.htm?byaddress"
-
-
-# ─── Claude context blurb ─────────────────────────────────────────────────────
-
-# ─── Rule-based blurb engine ──────────────────────────────────────────────────
-
-
-DEMOTION_LABELS = {0: "Excellent", 1: "Good", 2: "Acceptable", 3: "Bad"}
-
-
-def _demotion_to_label(n: int) -> str:
-    if n <= 0: return "Excellent"
-    if n == 1: return "Good"
-    if n == 2: return "Acceptable"
-    return "Bad"
-
-
-def _address_diff_type(result_addr: str, official_addr: str) -> str | None:
-    """
-    Compare result address vs official address and return the sub-type of
-    the first detected difference, or None if they match (case-insensitive,
-    ignoring punctuation differences).
-    """
-    def norm(s):
-        return " ".join(s.lower().replace(",", " ").replace(".", " ").split())
-
-    r = norm(result_addr)
-    o = norm(official_addr)
-    if r == o:
-        return None
-
-    r_tokens = r.split()
-    o_tokens = o.split()
-
-    DIRECTIONS = {"n","s","e","w","ne","nw","se","sw","north","south","east","west"}
-    STREET_TYPES = {"st","street","rd","road","ave","avenue","blvd","boulevard",
-                    "dr","drive","ln","lane","ct","court","pl","place","way","cir","circle"}
-    UNIT_WORDS   = {"suite","ste","unit","apt","#","floor","fl","building","bldg"}
-
-    # Check if first token (street number) differs
-    if r_tokens and o_tokens and r_tokens[0] != o_tokens[0]:
-        if r_tokens[0].isdigit() or o_tokens[0].isdigit():
-            return "Street Number"
-
-    # Check for unit/apt presence in one but not the other
-    r_has_unit = any(t in UNIT_WORDS for t in r_tokens)
-    o_has_unit = any(t in UNIT_WORDS for t in o_tokens)
-    if r_has_unit != o_has_unit:
-        return "Unit/Apt"
-
-    # Check for direction or street-type difference
-    r_dirs = {t for t in r_tokens if t in DIRECTIONS}
-    o_dirs = {t for t in o_tokens if t in DIRECTIONS}
-    if r_dirs != o_dirs:
-        return "Street Name"
-
-    r_types = {t for t in r_tokens if t in STREET_TYPES}
-    o_types = {t for t in o_tokens if t in STREET_TYPES}
-    if r_types != o_types:
-        return "Street Name"
-
-    # Generic fallback
-    return "Street Name"
-
-
-def generate_blurb_local(params: dict) -> str:
-    """
-    Rule-based exam comment blurb generator.
-    Returns a multi-section string in TELUS exam bracket format.
-    """
-    query       = params.get("query", "").strip()
-    qtype       = params.get("query_type", "Chain Business")
-    vp_status   = params.get("viewport_status", "Fresh")
-    user_inside = params.get("user_inside_vp", None)   # True/False/None
-    is_closed   = params.get("is_closed", False)
-    demotion    = params.get("demotion", 0)             # int, computed from distances
-    few_results = params.get("few_results", False)
-    result_name = params.get("result_name", "").strip()
-    result_addr = params.get("result_address", "").strip()
-    result_cls  = params.get("classification", "").strip()
-    official_name = params.get("official_name", "").strip()
-    official_addr = params.get("official_address", "").strip()
-    addr_does_not_exist = params.get("addr_does_not_exist", False)
-    notes       = params.get("notes", "").strip()
-    nearby_modifier = params.get("nearby_modifier", False)
-    loc_modifier    = params.get("loc_modifier", False)   # chain + city/state modifier
-
-    sections = []
-
-    # ── 1. RELEVANCE ──────────────────────────────────────────────────────────
-    rel_lines = []
-
-    # Address queries (Specific / Non-specific / Non-existing)
-    if qtype == "Specific Address":
-        rel_lines.append(
-            f"[Relevance- Navigational] The queried address points to a single location that can be "
-            f"verified with the USPS. The result matches the queried address. According to Section 10.1, "
-            f"Specific Address, when the query is an address and the user explicitly states their location "
-            f"intent by including a locality, this is an explicit location query and the user's viewport "
-            f"and location are irrelevant. The query refers to a unique location, so a result for this "
-            f"exact location should be rated Navigational."
-        )
-    elif qtype == "Non-Specific Address":
-        rel_lines.append(
-            f"[Relevance- Acceptable] The query is for a non-specific or incomplete address "
-            f"(missing street number or locality). According to Section 10.1, Specific Address — "
-            f"example: 'Sugarloaf Key St.' — when the result is the queried street without a street "
-            f"number, the relevance rating is Acceptable."
-        )
-    elif qtype == "Non-Existing Address":
-        rel_lines.append(
-            f"[Relevance- Excellent] The query is an address that does not exist. According to "
-            f"Section 10.3, Query Address Does Not Exist, when research shows the full query address "
-            f"does not exist and the result is the same address as the query address, the relevance "
-            f"rating is Excellent. A Navigational rating cannot be applied to an address which does "
-            f"not exist."
-        )
-
-    # Category query
-    elif qtype == "Category Query":
-        rel_label = _demotion_to_label(demotion)
-        sub = " - Distance/Prominence Issue" if demotion > 0 else ""
-        cls_lower = result_cls.lower()
-        # Is result a sub-business inside the category target?
-        cat_terms = ["mall", "shopping center", "plaza", "airport", "terminal",
-                     "park", "complex", "center", "hospital"]
-        possible_sub = any(t in query.lower() for t in cat_terms)
-        if possible_sub and result_cls and not any(t in cls_lower for t in cat_terms):
-            rel_lines.append(
-                f"[Relevance- Bad - User Intent] This is a category query for a {query}. "
-                f"The result is a {result_name}, located inside {query}, but users will have no way "
-                f"of knowing this simply from looking at the result. This result does not satisfy "
-                f"user intent and should be rated Bad. See the Sephora example in Section 10.7.8, "
-                f"Clear Categories."
-            )
-        else:
-            rel_lines.append(
-                f"[Relevance- {rel_label}{sub}] This is a category query for a {query}. "
-                f"The result matches the category query intent and is within the fresh viewport. "
-                f"For more details on rating Category queries, see Section 10.7."
-                + (f" This result fits the primary intent and is within the FVP; no demotion is required." if demotion == 0
-                   else f" A -{demotion} demotion is applied for distance.")
-            )
-
-    # Locality query
-    elif qtype == "Locality Query":
-        cls_lower = result_cls.lower()
-        transit_terms = ["station", "airport", "terminal", "transit", "subway", "metro", "train", "bus"]
-        is_transit = any(t in cls_lower for t in transit_terms) or any(t in result_name.lower() for t in transit_terms)
-        if is_transit:
-            rel_label = _demotion_to_label(demotion)
-            rel_lines.append(
-                f"[Relevance- {rel_label} - User Intent] The query is for {query}, a locality. "
-                f"The result is a transit POI associated with the queried locality, satisfying a "
-                f"secondary transit intent. Per Section 5.14, Unexpected Results — see the "
-                f"[san francisco] example — transit results within the queried locality qualify "
-                f"for secondary intent."
-                + (f" A -{demotion} demotion is applied for distance." if demotion > 0 else "")
-            )
-        else:
-            rel_lines.append(
-                f"[Relevance- Bad - User Intent] The query is for {query}, a locality. "
-                f"The result is a POI located within or near the city; however, it does not fulfil "
-                f"the secondary intent of the query, as it is neither internationally prominent nor "
-                f"a transit POI. Per Section 5.14, Unexpected Results — see the [soho] example — "
-                f"the Relevance rating should be Bad - User Intent Issue."
-            )
-
-    # Transit query
-    elif qtype == "Transit Query":
-        if demotion == 0:
-            rel_lines.append(
-                f"[Relevance- Navigational] The query is for {query}, a transit POI. "
-                f"Research confirms there is only one station with a name that exactly matches "
-                f"the query. As a singular, exact match, this result qualifies for a Navigational "
-                f"rating. Per Section 5.16.1, Transit Queries — see the [Stockport Station] example."
-            )
-        elif demotion == 1:
-            rel_lines.append(
-                f"[Relevance- Good] The query is for {query}, a transit POI. Per Section 5.16.1, "
-                f"Transit Queries — similar to the [Stockport Station] example — this station falls "
-                f"just outside the requested locality in a neighbouring locality. It still provides "
-                f"a relevant choice for the user. A -1 demotion is applied for distance."
-            )
-        elif demotion == 2:
-            rel_lines.append(
-                f"[Relevance- Acceptable] The query is for {query}, a transit POI. Per Section 5.16.1, "
-                f"Transit Queries, this station is outside the requested locality. The fewer choices "
-                f"available, the farther results can be and still be relevant. A -2 demotion is applied."
-            )
-        else:
-            rel_lines.append(
-                f"[Relevance- Excellent] The query is for {query}, a transit POI. Per Section 5.16.1, "
-                f"when there is no station that perfectly matches the query name, each station within "
-                f"the requested locality is Excellent. This result falls within the locality and "
-                f"matches the intent."
-            )
-
-    # Chain + location modifier
-    elif qtype == "Chain + Location Modifier":
-        rel_label = _demotion_to_label(demotion)
-        sub = " - Distance/Prominence Issue" if demotion > 0 else ""
-        rel_lines.append(
-            f"[Relevance- {rel_label}{sub}] The query is for a chain business with a general "
-            f"location modifier. Per Section 10.6.3, Chain Business with Location Modifier, "
-            f"user and viewport location should be ignored; results are expected within the "
-            f"specified location modifier."
-            + (f" This result is within the modifier; no demotion is required." if demotion == 0
-               else f" This result is outside the specified location modifier. A -{demotion} demotion is applied for distance.")
-        )
-
-    # Service-level mismatch
-    elif notes and any(kw in notes.lower() for kw in ["mismatch", "different brand", "competitor", "wrong brand"]):
-        rel_lines.append(
-            f"[Relevance- Bad - User Intent] Per Section 5.18, Service-Level Mismatch — "
-            f"see the Burger King / McDonald's example — when the query is for a specific branded "
-            f"POI, results are only expected to match that specific brand. Other brands offering "
-            f"similar services are considered irrelevant. The result is a different brand than "
-            f"the queried business."
-        )
-
-    # Default: Chain Business (with or without nearby modifier)
-    else:
-        rel_label = _demotion_to_label(demotion)
-        sub = " - Distance/Prominence Issue" if demotion > 0 else ""
-        rel_label_full = f"{rel_label}{sub}"
-
-        if nearby_modifier:
-            loc_rule = (
-                f"According to Section 2.3.1 of the guidelines on Explicit Location, if the query "
-                f"contains words like 'near me' or 'nearest,' the user's location — not the viewport "
-                f"— should be considered the explicit location intent."
-            )
-        elif vp_status == "Stale":
-            loc_rule = (
-                f"The viewport is STALE. According to Section 2.3.2 of the guidelines on Implicit "
-                f"Location, when the viewport is stale, consider only the user location as the "
-                f"location intent."
-            )
-        elif user_inside is True:
-            loc_rule = (
-                f"The user is located inside the fresh viewport (FVP). According to Section 2.3.2 "
-                f"of the guidelines on Implicit Location, when the user is inside the FVP, take "
-                f"the user location as the location intent."
-            )
-        elif user_inside is False:
-            loc_rule = (
-                f"The user is located outside the fresh viewport (FVP). According to Section 2.3.2 "
-                f"of the guidelines on Implicit Location, when the user is outside the FVP, results "
-                f"are expected to be in or near the viewport area. All relevant results within the "
-                f"viewport are eligible for an Excellent rating."
-            )
-        else:
-            loc_rule = "The viewport and user location context applies per Section 2.3.2."
-
-        if is_closed:
-            closed_note = (
-                f" Research shows this result is no longer operational. If you select the "
-                f"\"Business/POI is closed or does not exist\" checkbox, you must still evaluate "
-                f"the result Relevance as if the business/POI were operational. Avoid automatically "
-                f"assigning a Bad rating. Refer to Section 4.2.2: Rating Relevance of "
-                f"Closed/Non-existing Business/POI for guidance."
-            )
-        else:
-            closed_note = ""
-
-        if demotion == 0:
-            demotion_note = " This result fits the primary intent and is within the FVP; no demotion is required."
-        else:
-            few_note = (
-                f" Review Sections 5.7 and 5.8, Few Possible Results — leniency on distance is "
-                f"acceptable when there are only a few possible results for the query in the area."
-                if few_results else ""
-            )
-            demotion_note = (
-                f" While this result fits the primary intent, research indicates that there is/are "
-                f"closer {query} location(s) in the area. Therefore, a -{demotion} demotion is applied."
-                f"{few_note}"
-            )
-
-        rel_lines.append(
-            f"[Relevance- {rel_label_full}] The query is for {query}, a chain business. "
-            f"{loc_rule}{demotion_note}{closed_note}"
-        )
-
-    sections.append("\n".join(rel_lines))
-
-    # ── 2. NAME ───────────────────────────────────────────────────────────────
-    # Skip Name/Address entirely for closed POIs
-    if is_closed:
-        sections.append(
-            "[Name- N/A] Per Section 4.2.2, when the \"Business/POI is closed or does not exist\" "
-            "checkbox is selected, Name, Address, and Pin do not need to be rated."
-        )
-    elif qtype in ("Specific Address", "Non-Specific Address", "Non-Existing Address", "Locality Query"):
-        sections.append(
-            "[Name- N/A] Per Section 6.1, Name Not Applicable (n/a), the N/A rating should be used "
-            "for all address-type results, including residential addresses, streets, localities, and so on."
-        )
-    else:
-        # Classification mismatch?
-        cls_issue = detect_classification_issue(query, result_cls) if result_cls else None
-        if cls_issue:
-            sections.append(
-                f"[Name- Incorrect - Incorrect Category] The business name matches the official "
-                f"website; however, the classification \"{result_cls}\" does not accurately represent "
-                f"this business. Per Section 6.3.2, Incorrect Category, when the business name is "
-                f"correct but the category is not, the Name Accuracy is Incorrect."
-            )
-        elif official_name and official_name.lower() != result_name.lower():
-            sections.append(
-                f"[Name- Incorrect] The result name \"{result_name}\" does not match the name on "
-                f"the official website (\"{official_name}\"). Per Section 6.2, the name must match "
-                f"the official source."
-            )
-        else:
-            sections.append(
-                f"[Name- Correct] The name matches the name on the official website, and the "
-                f"classification is correct."
-            )
-
-    # ── 3. ADDRESS ────────────────────────────────────────────────────────────
-    if is_closed:
-        pass  # already handled in Name block above; skip adding a duplicate
-    elif qtype == "Non-Existing Address":
-        sections.append(
-            "[Address- Incorrect - Address Does Not Exist] The result address cannot be verified "
-            "through street-level imagery, web-based resources, or the official postal service "
-            "address verification tool. When attempting to confirm the address on USPS, it fails "
-            "verification because the queried street number does not correspond to an existing "
-            "address on the given street. Per Section 7.2, Address Does Not Exist."
-        )
-    elif qtype in ("Non-Specific Address",):
-        sections.append(
-            "[Address- Correct] The result address is accurate — the street is valid and exists "
-            "within the specified locality. This can be verified through the USPS address tool."
-        )
-    elif qtype == "Transit Query":
-        sections.append(
-            f"[Address- Correct] Transit stations are POIs for which a full street address is not "
-            f"required, even if one exists on the official website. The minimum required component "
-            f"is the correct locality. Per Section 8.3.2.1, Minimum Address Component — see the "
-            f"[Quincy Station] example."
-        )
-    elif addr_does_not_exist:
-        sections.append(
-            "[Address- Incorrect - Address Does Not Exist] The result address cannot be verified "
-            "via the official postal service address verification tool or web-based resources. "
-            "Per Section 7.2, Address Does Not Exist and the Country Specific Guidelines."
-        )
-    elif official_addr and official_addr.strip():
-        diff_type = _address_diff_type(result_addr, official_addr)
-        if diff_type is None:
-            sections.append(
-                f"[Address- Correct] The result address matches the official website "
-                f"({official_addr})."
-            )
-        elif diff_type == "Street Number":
-            sections.append(
-                f"[Address- Incorrect - Street Number] The result address does not match the "
-                f"official website. The street number listed ({result_addr.split()[0] if result_addr else '?'}) "
-                f"is incorrect. Correct: {official_addr}. Per Section 7.1.1, Street Number."
-            )
-        elif diff_type == "Street Name":
-            sections.append(
-                f"[Address- Incorrect - Street Name] The listed address does not match the official "
-                f"address. The result address street name or direction differs from the official "
-                f"website ({official_addr}). USPS confirms the correct form. "
-                f"Per Section 7.1.3, Street Name, subsection Street Directions and Types."
-            )
-        elif diff_type == "Unit/Apt":
-            sections.append(
-                f"[Address- Incorrect - Unit/Apt] The address does not match the official website. "
-                f"The result address is missing or has an incorrect unit/suite number. "
-                f"Correct: {official_addr}. Per Section 7.1.2, Unit/Apt."
-            )
-        else:
-            sections.append(
-                f"[Address- Incorrect] The result address does not match the official website. "
-                f"Correct: {official_addr}."
-            )
-    else:
-        sections.append(
-            "[Address- Correct] The result address matches the official website."
-        )
-
-    # ── 4. PIN (placeholder — no map available) ───────────────────────────────
-    if not is_closed and qtype not in ("Non-Existing Address",):
-        sections.append(
-            "[Pin- See map] Pin accuracy must be verified against street-level and aerial imagery. "
-            "Per Section 9.4, Single Rooftop: pin on correct rooftop = Perfect; on same parcel = "
-            "Approximate; adjacent same-block property = Next Door; wrong block or across street = Wrong."
-        )
-    elif qtype == "Non-Existing Address":
-        sections.append(
-            "[Pin- Can't Verify] Per Section 10.3, when an address does not exist, the Pin Accuracy "
-            "is rated Can't Verify. There is no exact position for the pin to be placed."
-        )
-
-    # ── 5. Extra notes ────────────────────────────────────────────────────────
-    if notes:
-        sections.append(f"[Notes] {notes}")
-
-    return "\n\n".join(sections)
-
-
-# ─── Helper: resolve location input ──────────────────────────────────────────
-def resolve_location(label: str, use_address: bool, address_val: str, lat_val, lon_val):
-    """Returns (lat, lon, display) or (None, None, error_msg)."""
-    if use_address and address_val.strip():
-        with st.spinner(f"Geocoding {label}…"):
-            result = geocode_address(address_val.strip())
-        if result:
-            return result[0], result[1], result[2]
-        else:
-            return None, None, f"Could not geocode: {address_val}"
-    elif not use_address and lat_val is not None and lon_val is not None:
-        return float(lat_val), float(lon_val), f"{lat_val:.6f}, {lon_val:.6f}"
-    return None, None, "Not set"
-
-
-# ─── Sidebar inputs ───────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🗺️ TELUS Maps Study Aid")
     st.divider()
-    st.markdown("### 🔍 Query")
-    query = st.text_input("Search query", placeholder="e.g. Taco Bell, Shell, mall")
-    # query_type = st.selectbox("Query type", [
-    #     "Chain Business",
-    #     "Chain + Nearby Modifier",
-    #     "Chain + Location Modifier",
-    #     "Category Query",
-    #     "Specific Address",
-    #     "Non-Specific Address",
-    #     "Non-Existing Address",
-    #     "Locality Query",
-    #     "Transit Query",
-    # ])
-    
-    auto_meta = infer_query_metadata(query)
-    st.caption("Auto-detected query hints")
-    st.write({
-        "suggested_query_type": auto_meta["query_type"],
-        "suggested_chain": auto_meta["chain"],
-        "suggested_classification": auto_meta["classification"],
-        "nearby_modifier": auto_meta["nearby_modifier"],
-        "location_modifier": auto_meta["loc_modifier"],
-    })
-    query_type_options = [
-        "Chain Business",
-        "Chain + Nearby Modifier",
-        "Chain + Location Modifier",
-        "Category Query",
-        "Specific Address",
-        "Non-Specific Address",
-        "Non-Existing Address",
-        "Locality Query",
-        "Transit Query",
-    ]
-    default_qtype = auto_meta["query_type"] if auto_meta["query_type"] in query_type_options else "Chain Business"
-    query_type = st.selectbox(
-        "Query type",
-        query_type_options,
-        index=query_type_options.index(default_qtype)
-    )
-
-    nearby_modifier = st.checkbox(
-        "Query contains 'nearby / near me / nearest'",
-        value=auto_meta["nearby_modifier"],
-        key="nearby_modifier_a"
-    )
-    loc_modifier = st.checkbox(
-        "Query has a general location modifier (e.g. 'Walmart Tomball TX')",
-        value=auto_meta["loc_modifier"]
-    )
+    result_count  = st.number_input("Number of Results", min_value=1, max_value=5, value=1, step=1)
 
     st.divider()
-    st.markdown("### 📺 Viewport")
-    viewport_status = st.radio("Viewport freshness", ["Fresh", "Stale"], horizontal=True)
-    vp_mode = st.toggle("Enter viewport center as address", key="vp_mode")
-    if vp_mode:
-        vp_address = st.text_input("Viewport center address", key="vp_addr")
-        vp_lat, vp_lon = None, None
-    else:
-        vp_address = ""
-        c1, c2 = st.columns(2)
-        vp_lat = c1.number_input("VP Lat", value=None, format="%.6f", key="vp_lat")
-        vp_lon = c2.number_input("VP Lon", value=None, format="%.6f", key="vp_lon")
-
-    st.divider()
-    st.markdown("### 👤 User Location")
-    user_mode = st.toggle("Enter user location as address", key="user_mode")
-    if user_mode:
-        user_address = st.text_input("User address", key="user_addr")
-        user_lat, user_lon = None, None
-    else:
-        user_address = ""
-        c1, c2 = st.columns(2)
-        user_lat = c1.number_input("User Lat", value=None, format="%.6f", key="user_lat")
-        user_lon = c2.number_input("User Lon", value=None, format="%.6f", key="user_lon")
-
-    st.divider()
-    st.markdown("### 📍 Result Pin(s)")
-    num_results = st.number_input("Number of results", min_value=1, max_value=6, value=1, step=1)
-
-    result_pins = []
-    for i in range(int(num_results)):
-        with st.expander(f"Result {i+1}", expanded=(i == 0)):
-            r_name = st.text_input("Result name", key=f"r_name_{i}", placeholder="e.g. Taco Bell")
-            # r_addr = st.text_input("Result address (shown)", key=f"r_addr_{i}", placeholder="e.g. 123 Main St")
-            r_street = st.text_input("Street", key=f"r_street_{i}")
-            r_city   = st.text_input("City", key=f"r_city_{i}")
-            r_state  = st.text_input("State", key=f"r_state_{i}")
-            r_zip    = st.text_input("ZIP", key=f"r_zip_{i}")
-            r_class = st.text_input("Classification", key=f"r_class_{i}", placeholder="e.g. Fast Food Restaurant")
-            r_mode = st.toggle("Enter as address", key=f"r_mode_{i}")
-            if r_mode:
-                r_geocode_addr = st.text_input("Geocode address", key=f"r_gc_{i}")
-                r_lat, r_lon = None, None
-            else:
-                r_geocode_addr = ""
-                cc1, cc2 = st.columns(2)
-                r_lat = cc1.number_input("Lat", value=None, format="%.6f", key=f"r_lat_{i}")
-                r_lon = cc2.number_input("Lon", value=None, format="%.6f", key=f"r_lon_{i}")
-            r_closed = st.checkbox("Closed / does not exist", key=f"r_closed_{i}")
-            r_official_name = st.text_input("Name on official site", key=f"r_oname_{i}", placeholder="Leave blank if same")
-            r_official_addr = st.text_input("Address on official site", key=f"r_oaddr_{i}", placeholder="Leave blank if same")
-            usps_data = verify_address_with_usps(
-                street=r_street,
-                city=r_city,
-                state=r_state,
-                zip_code=r_zip,
-                secondary="",
-            )
-            st.checkbox(f"Valid USPS: {usps_data['valid']}", value=usps_data["valid"], disabled=True)
-        # st.write(usps_data)
-            result_pins.append({
-                "name": r_name,
-                "r_address": " ".join([r_street, r_city, r_state, r_zip]),
-                "address": r_street, "city": r_city,
-                "state": r_state, "postal": r_zip, "classification": r_class,
-                "mode": r_mode, "geocode_addr": r_geocode_addr,
-                "lat": r_lat, "lon": r_lon,
-                "closed": r_closed,
-                "official_name": r_official_name,
-                "official_address": r_official_addr,
-                "usps": usps_data
-            })
-
-    st.divider()
-    st.markdown("### 🧠 Blurb Parameters")
-
-    user_inside_vp = st.radio(
-        "User position relative to viewport",
-        ["Inside FVP", "Outside FVP", "N/A (stale or explicit)"],
-        horizontal=False,
-    )
-    user_inside_map = {"Inside FVP": True, "Outside FVP": False, "N/A (stale or explicit)": None}
-
-    nearby_modifier   = st.checkbox("Query contains 'nearby / near me / nearest'", key="nearby_modifier_b")
-    loc_modifier      = st.checkbox("Query has a general location modifier (e.g. 'Walmart Tomball TX')", key="loc_modifie_b")
-    few_results       = st.checkbox("Few real-world results exist in the area (leniency applies)", key="few_results_b")
-    addr_dne_override = st.checkbox("Override: address does not exist", key="addr_dne_override_b")
-    demotion          = st.number_input("Distance demotion (-0 / -1 / -2 / -3)", min_value=0, max_value=3, value=0, step=1)
-
-    st.divider()
-    st.markdown("### 📝 Extra Notes")
-    extra_notes = st.text_area(
-        "Additional notes (service mismatch, competitor, other flags)",
-        placeholder="e.g. result is a competitor brand; 2 closer locations found on official site",
-        height=80,
-    )
-
-    st.divider()
-    generate_btn = st.button("⚡ Generate Context Blurb", type="primary", use_container_width=True)
-    render_btn   = st.button("🗺️ Render Map", use_container_width=True)
+    render_map_btn = st.button("🗺️ Render Map",  use_container_width=True)
+    evaluate_btn   = st.button("⚡ Evaluate",     use_container_width=True, type="primary")
 
 
-# ─── Resolve all coordinates ──────────────────────────────────────────────────
-resolved_vp   = resolve_location("viewport",      vp_mode,   vp_address,   vp_lat,   vp_lon)
-resolved_user = resolve_location("user",           user_mode, user_address, user_lat, user_lon)
+# ─────────────────────────────────────────────────────────────────────────────
+# Title
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("🗺️ Maps Search Rating Sandbox")
 
+if locale != "en_US":
+    st.warning(f"Locale is not en_US (got: {locale}) — unexpected language detection may be inaccurate.")
+if country != "United States":
+    st.warning(f"Country is not 'United States' (got: {country}).")
 
-resolved_results = []
-for i, r in enumerate(result_pins):
-    lat, lon, disp = resolve_location(
-        f"result {i+1}", r["mode"], r["geocode_addr"], r["lat"], r["lon"]
-    )
-    resolved_results.append({**r, "resolved_lat": lat, "resolved_lon": lon, "resolved_disp": disp})
-    
-
-# verified_results = []
-# for r in resolved_results:
-#     usps_data = None
-#     if r["r_address"] and query_type in ("Specific Address", "Non-Specific Address", "Non-Existing Address", "Chain Business", "Chain + Nearby Modifier", "Chain + Location Modifier"):
-#         # Best effort: use entered result address plus user-provided city/state if present in the address field context.
-#         # If your result address is a full single-line address, you may want a dedicated parser later.
-#         usps_data = verify_address_with_usps(
-#             street=r["address"],
-#             city=r["city"],
-#             state=r["state"],
-#             zip_code=r["postal"],
-#             secondary="",
-#         )
-#         # st.write(usps_data)
-#     verified_results.append({**r, "usps": usps_data})
-# resolved_results = verified_results
-
-# ─── Main content ─────────────────────────────────────────────────────────────
-st.markdown("## 🗺️ TELUS Maps Analyst — Study Aid")
-
-
-# ── Query / scenario header ──
-if query:
-    col_q, col_vp, col_qt = st.columns([2, 1, 1])
-    with col_q:
-        st.markdown(f"""
-        <div class='card'>
-            <div class='card-title'>Query</div>
-            <span style='font-size:20px;font-weight:700;color:#f1f5f9'>"{query}"</span>
-        </div>""", unsafe_allow_html=True)
-    with col_vp:
-        vp_color = "tag-green" if viewport_status == "Fresh" else "tag-amber"
-        st.markdown(f"""
-        <div class='card'>
-            <div class='card-title'>Viewport</div>
-            <span class='tag {vp_color}'>{viewport_status}</span>
-        </div>""", unsafe_allow_html=True)
-    with col_qt:
-        st.markdown(f"""
-        <div class='card'>
-            <div class='card-title'>Query Type</div>
-            <span class='tag tag-purple'>{query_type}</span>
-        </div>""", unsafe_allow_html=True)
-
-
-# ── Classification check ──
-for i, r in enumerate(result_pins):
-    if r["classification"] and query:
-        issue = detect_classification_issue(query, r["classification"])
-        if issue:
-            st.markdown(f"<div class='warn-box'>⚠ Result {i+1} — {issue}</div>", unsafe_allow_html=True)
-
-
-# ── Chain locator link ──
-if query:
+# ─────────────────────────────────────────────────────────────────────────────
+# Chain locator banner (shows before any result entry)
+# ─────────────────────────────────────────────────────────────────────────────
+if query.strip():
     locator_url, found = get_chain_locator(query)
     if found:
-        st.markdown(f"""
-        <div class='card'>
-            <div class='card-title'>Official Chain Locator</div>
-            <a href='{locator_url}' target='_blank' class='link-btn link-btn-primary'>
-                🔗 {query.title()} — Official Store Locator
-            </a>
-        </div>""", unsafe_allow_html=True)
+        st.info(f"🔗 **Official chain locator detected:** [Open locator for *{query}*]({locator_url})")
     else:
-        st.markdown(f"""
-        <div class='card'>
-            <div class='card-title'>Chain Locator — Not in database</div>
-            <span style='font-size:12px;color:#64748b;margin-right:8px'>No direct URL found for "{query}".</span>
-            <a href='{locator_url}' target='_blank' class='link-btn link-btn-warn'>
-                🔍 Google Search: {query} store locator
-            </a>
-        </div>""", unsafe_allow_html=True)
+        st.caption(f"No known chain locator for *{query}*. [Search for official locator]({locator_url})")
 
 
-# ── Map ──
-map_col, info_col = st.columns([3, 2])
+# ─────────────────────────────────────────────────────────────────────────────
+# Result entry tabs
+# ─────────────────────────────────────────────────────────────────────────────
+result_ui_rows: list[dict] = []
+tabs = st.tabs([f"Result {i}" for i in range(1, int(result_count) + 1)])
 
+for idx, tab in enumerate(tabs, start=1):
+    with tab:
+        st.subheader(f"Result {idx}")
 
-with map_col:
-    st.markdown("### Map")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            name           = st.text_input("Name",           key=f"r_name_{idx}")
+            address        = st.text_input("Address",        key=f"r_address_{idx}",
+                                           placeholder="Street, City, ST ZIP")
+            classification = st.text_input("Classification", key=f"r_class_{idx}",
+                                           placeholder="e.g. Grocery Store")
+            result_type    = st.selectbox(
+                "Type",
+                ["BUSINESS", "ADDRESS", "LOCALITY", "TRANSIT", "NATURAL_FEATURE"],
+                key=f"r_type_{idx}",
+            )
+            status = st.selectbox(
+                "Status",
+                ["OPEN", "CLOSED", "PERMANENT_CLOSURE", "UNKNOWN"],
+                key=f"r_status_{idx}",
+            )
 
-    # Determine map center
-    center = [39.5, -98.35]  # US center default
-    zoom = 4
-    if resolved_vp[0] is not None:
-        center = [resolved_vp[0], resolved_vp[1]]
-        zoom = 11
-    elif resolved_user[0] is not None:
-        center = [resolved_user[0], resolved_user[1]]
-        zoom = 12
-
-    m = folium.Map(location=center, zoom_start=zoom, tiles="CartoDB dark_matter")
-
-    # Viewport center marker (blue square)
-    if resolved_vp[0] is not None:
-        vp_color_map = "#3b82f6" if viewport_status == "Fresh" else "#f59e0b"
-        folium.Marker(
-            [resolved_vp[0], resolved_vp[1]],
-            popup=f"Viewport Center<br>{resolved_vp[2]}",
-            tooltip="📺 Viewport Center",
-            icon=folium.Icon(color="blue" if viewport_status == "Fresh" else "orange",
-                             icon="tv", prefix="fa")
-        ).add_to(m)
-
-    # User marker (green person)
-    if resolved_user[0] is not None:
-        folium.Marker(
-            [resolved_user[0], resolved_user[1]],
-            popup=f"User<br>{resolved_user[2]}",
-            tooltip="👤 User Location",
-            icon=folium.Icon(color="green", icon="user", prefix="fa")
-        ).add_to(m)
-
-    # Result pins
-    pin_colors = ["red", "purple", "darkred", "cadetblue", "darkblue", "pink"]
-    for i, r in enumerate(resolved_results):
-        if r["resolved_lat"] is not None:
-            popup_html = f"""
-            <b>{r['name'] or f'Result {i+1}'}</b><br>
-            {r['address'] or ''}<br>
-            <i>{r['classification'] or ''}</i>
-            {'<br><b style="color:red">⚠ CLOSED</b>' if r['closed'] else ''}
-            """
-            folium.Marker(
-                [r["resolved_lat"], r["resolved_lon"]],
-                popup=folium.Popup(popup_html, max_width=200),
-                tooltip=f"📍 Result {i+1}: {r['name'] or 'unnamed'}",
-                icon=folium.Icon(color=pin_colors[i % len(pin_colors)],
-                                 icon="map-marker", prefix="fa")
-            ).add_to(m)
-            # Line from user to result
-            if resolved_user[0] is not None:
-                folium.PolyLine(
-                    [[resolved_user[0], resolved_user[1]],
-                     [r["resolved_lat"], r["resolved_lon"]]],
-                    color=("#ef4444" if i == 0 else "#a78bfa"),
-                    weight=1.5, opacity=0.5, dash_array="5"
-                ).add_to(m)
-
-    st_folium(m, width=None, height=480, returned_objects=[])
-
-
-with info_col:
-    st.markdown("### Distances & Links")
-
-    # ── Distances ──
-    for i, r in enumerate(resolved_results):
-        with st.expander(f"📍 Result {i+1}: {r['name'] or 'Unnamed'}", expanded=True):
-            if r["resolved_lat"] is not None:
-
-                # Distance: user → result
-                if resolved_user[0] is not None:
-                    d_km  = haversine_km(resolved_user[0], resolved_user[1],
-                                         r["resolved_lat"], r["resolved_lon"])
-                    d_mi  = km_to_miles(d_km)
-                    color_class = "dist-good" if d_mi < 2 else "dist-warn" if d_mi < 10 else "dist-bad"
-                    st.markdown(f"**User → Result:** <span class='{color_class}'>{d_mi:.2f} mi ({d_km:.2f} km)</span>",
-                                unsafe_allow_html=True)
-
-                # Distance: viewport → result
-                if resolved_vp[0] is not None:
-                    dv_km = haversine_km(resolved_vp[0], resolved_vp[1],
-                                         r["resolved_lat"], r["resolved_lon"])
-                    dv_mi = km_to_miles(dv_km)
-                    color_class = "dist-good" if dv_mi < 5 else "dist-warn" if dv_mi < 20 else "dist-bad"
-                    st.markdown(f"**VP → Result:** <span class='{color_class}'>{dv_mi:.2f} mi ({dv_km:.2f} km)</span>",
-                                unsafe_allow_html=True)
-
-                # Closed badge
-                if r["closed"]:
-                    st.markdown("<span class='tag tag-red'>⚠ CLOSED / NON-EXISTENT</span>", unsafe_allow_html=True)
-
-                # Classification check
-                if r["classification"] and query:
-                    issue = detect_classification_issue(query, r["classification"])
-                    if issue:
-                        st.markdown(f"<span class='tag tag-amber'>⚠ Classification mismatch</span>", unsafe_allow_html=True)
-
-                # Official name/address diff
-                if r["official_name"] and r["official_name"].strip() and r["official_name"].lower() != (r["name"] or "").lower():
-                    st.markdown(f"**Name diff:** `{r['name']}` → official: `{r['official_name']}`")
-                if r["official_address"] and r["official_address"].strip() and r["official_address"].lower() != (r["address"] or "").lower():
-                    st.markdown(f"**Address diff:** `{r['address']}` → official: `{r['official_address']}`")
-
-                st.divider()
-
-                # Quick links
-                gm_url = google_maps_link(r["resolved_lat"], r["resolved_lon"])
-                usps_url = usps_link(r["address"] or "")
-
-                st.markdown(f"""
-                <a href='{gm_url}' target='_blank' class='link-btn link-btn-primary'>📍 Google Maps</a>
-                <a href='{usps_url}' target='_blank' class='link-btn link-btn-green'>📮 USPS Verify</a>
-                """, unsafe_allow_html=True)
-
-                if r["address"]:
-                    addr_gm = google_maps_address_link(r["address"])
-                    st.markdown(f"<a href='{addr_gm}' target='_blank' class='link-btn'>🔍 Address in Maps</a>",
-                                unsafe_allow_html=True)
+        k_official_addr = f"r_official_addr_{idx}"
+        with col_b:
+            result_mode = st.radio(
+                "Result Location Mode",
+                ["Address", "Lat/Lon", "Same"],
+                horizontal=True, key=f"r_mode_{idx}",
+            )
+            result_geocode_addr = result_lat = result_lon = ""
+            if result_mode in ("Address", "Same"):
+                k = f"r_geocode_addr_{idx}"
+                if result_mode == "Same":
+                    st.session_state.update({k: address, k_official_addr: address})
+                result_geocode_addr = st.text_input(
+                    "Result Geocode Address / Place", key=k,
+                    placeholder="Used only for map pin placement",
+                )
             else:
-                st.caption(f"No coordinates set. {r['resolved_disp']}")
-                
-        
-        
-        
-        
-            usps_data = r.get("usps")
-            if usps_data:
-                st.markdown("**USPS Verification**")
-                if usps_data["ok"]:
-                    dpv = usps_data.get("dpv_value") or "Not returned"
-                    exists = usps_data.get("exists")
-                    if exists is True:
-                        exists_label = "Yes"
-                    elif exists is False:
-                        exists_label = "No"
-                    else:
-                        exists_label = "Unknown"
+                result_lat = st.text_input("Result Lat", key=f"r_lat_{idx}")
+                result_lon = st.text_input("Result Lon", key=f"r_lon_{idx}")
 
-                    st.write(f"DPV Indicator: {dpv}")
-                    st.write(f"DPV Accessible: {'Yes' if usps_data.get('dpv_accessible') else 'No'}")
-                    st.write(f"Address Exists: {exists_label}")
-                    st.write(f"Address Match Status: {usps_data.get('match_status') or '-'}")
+            official_name    = st.text_input("Official Name",    key=f"r_official_name_{idx}")
+            official_address = st.text_input("Official Address", key=k_official_addr)
 
-                    notes = usps_data.get("match_notes") or []
-                    if notes:
-                        for note in notes:
-                            st.caption(f"• {note}")
-
-                    st.caption(
-                        f"USPS standardized: "
-                        f"{usps_data.get('standardized_street') or '-'}, "
-                        f"{usps_data.get('standardized_city') or '-'}, "
-                        f"{usps_data.get('standardized_state') or '-'} "
-                        f"{usps_data.get('zip5') or '-'}-{usps_data.get('zip4') or ''}"
-                    )
-                else:
-                    st.warning(f"USPS verification failed: {usps_data.get('error')}")
-            else:
-                st.error(f"Could not find USPS data")
-                st.write("R:")
-                st.write(r)
-        
-        
-        
-        
-        
-        
-        
-
-    # ── User/VP quick links ──
-    st.markdown("### Location Links")
-    if resolved_user[0] is not None:
-        st.markdown(f"<a href='{google_maps_link(resolved_user[0], resolved_user[1])}' target='_blank' class='link-btn'>👤 User in Maps</a>", unsafe_allow_html=True)
-    if resolved_vp[0] is not None:
-        st.markdown(f"<a href='{google_maps_link(resolved_vp[0], resolved_vp[1])}' target='_blank' class='link-btn'>📺 Viewport in Maps</a>", unsafe_allow_html=True)
-
-
-# ── Distance summary if multiple results ──
-if len([r for r in resolved_results if r["resolved_lat"]]) > 1 and resolved_user[0] is not None:
-    st.markdown("### 📊 Distance Summary (User → Results, sorted)")
-    distances = []
-    for i, r in enumerate(resolved_results):
-        if r["resolved_lat"] is not None:
-            d_mi = km_to_miles(haversine_km(resolved_user[0], resolved_user[1],
-                                             r["resolved_lat"], r["resolved_lon"]))
-            distances.append((i+1, r["name"] or f"Result {i+1}", d_mi))
-    distances.sort(key=lambda x: x[2])
-    for rank, (ri, name, d) in enumerate(distances):
-        color = "#22c55e" if rank == 0 else "#f59e0b" if rank == 1 else "#f87171"
-        penalty = "" if rank == 0 else f" → -{rank} demotion suggested"
-        st.markdown(
-            f"<span style='color:{color}'>#{rank+1}</span> &nbsp; **Result {ri}** ({name}) — "
-            f"<span style='color:{color}'>{d:.2f} mi</span>"
-            f"<span style='color:#64748b;font-size:12px'>{penalty}</span>",
-            unsafe_allow_html=True
+        # ── USPS section ──────────────────────────────────────────────────
+        st.markdown("#### 📮 USPS Check")
+        parsed   = parse_simple_address(address)
+        use_usps = st.checkbox(
+            f"Run USPS validation for Result {idx}", value=True, key=f"r_use_usps_{idx}"
         )
 
-
-# ── Context Blurb ──
-st.markdown("---")
-st.markdown("### 📋 Context Blurb")
-
-
-if generate_btn:
-    if not query:
-        st.error("Please enter a search query in the sidebar.")
-    else:
-        r0 = resolved_results[0] if resolved_results else {}
-        params = {
-            "query":            query,
-            "query_type":       query_type,
-            "viewport_status":  viewport_status,
-            "user_inside_vp":   user_inside_map.get(user_inside_vp),
-            "nearby_modifier":  nearby_modifier,
-            "loc_modifier":     loc_modifier,
-            "few_results":      few_results,
-            # "addr_does_not_exist": addr_dne,
-            "demotion":         int(demotion),
-            "result_name":      r0.get("name", ""),
-            "result_address":   r0.get("address", ""),
-            "classification":   r0.get("classification", ""),
-            "is_closed":        r0.get("closed", False),
-            "official_name":    r0.get("official_name", ""),
-            "official_address": r0.get("official_address", ""),
-            "notes":            extra_notes,
+        EMPTY_USPS: dict = {
+            "ok": False, "valid": False, "exists": None,
+            "dpv_value": None, "dpv_accessible": False,
+            "standardized_street": None, "standardized_city": None,
+            "standardized_state": None, "zip5": None, "zip4": None,
+            "match_status": "", "match_notes": [], "error": None, "raw_response": {},
         }
-        
-        usps0 = r0.get("usps") if r0 else None
-        addr_does_not_exist = addr_dne_override
-        if usps0 and usps0.get("dpv_accessible"):
-            addr_does_not_exist = (usps0.get("dpv_value") or "").upper() == "N"
-        params.update({"addr_does_not_exist": addr_does_not_exist})
-        blurb = generate_blurb_local(params)
-        st.session_state["blurb"] = blurb
+        usps_data = dict(EMPTY_USPS)
+
+        if use_usps and parsed["street"] and parsed["city"] and parsed["state"]:
+            usps_data = verify_address_with_usps(
+                street=parsed["street"], city=parsed["city"],
+                state=parsed["state"], zip_code=parsed["zip"], secondary="",
+            )
+
+        with st.expander("USPS Raw Data", expanded=False):
+            st.json(parsed)
+            st.json(usps_data)
+
+        uc1, uc2, uc3, uc4 = st.columns(4)
+        usps_ok       = bool(usps_data["ok"])
+        dpv_accessible = bool(usps_data["dpv_accessible"])
+        exact_exists  = usps_data["exists"] is True
+
+        uc1.checkbox("USPS lookup OK",         value=usps_ok,        disabled=True, key=f"u_ok_{idx}")
+        uc2.checkbox("DPV accessible",          value=dpv_accessible, disabled=True, key=f"u_dpv_{idx}")
+        uc3.checkbox("Address exists (DPV=Y)",  value=exact_exists,   disabled=True, key=f"u_exists_{idx}")
+        uc4.text_input("Match Status", value=usps_data.get("match_status", ""),
+                       disabled=True, key=f"u_match_{idx}")
+
+        if usps_ok:
+            if exact_exists:
+                st.success("✅ USPS DPV confirms address exists (DPV=Y).")
+            elif dpv_accessible:
+                st.error("❌ USPS DPV does NOT confirm this address. Treat as Incorrect – Address does not exist.")
+            else:
+                st.warning("⚠️ USPS ran but DPV was not accessible. Check ZIP/state formatting.")
+
+        # ── Pin evidence ──────────────────────────────────────────────────
+        st.markdown("#### 📍 Pin Evidence")
+        st.caption(
+            "Fill these in after checking the result pin on Google/Bing Maps. "
+            "Leave as 'Unknown' if you haven't verified yet — the engine will flag it."
+        )
+        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+
+        def _tri(label: str, key: str):
+            return st.selectbox(
+                label, [None, True, False], index=0,
+                format_func=lambda x: "Unknown" if x is None else ("Yes" if x else "No"),
+                key=key,
+            )
+
+        with pc1: pin_boundary_identifiable = _tri("Boundary identifiable?",  f"pin_boundary_{idx}")
+        with pc2: pin_same_property         = _tri("On correct property?",    f"pin_property_{idx}")
+        with pc3: pin_same_block            = _tri("Same block / side?",       f"pin_block_{idx}")
+        with pc4: pin_adjacent_property     = _tri("Adjacent property?",       f"pin_adjacent_{idx}")
+        with pc5: pin_precise               = _tri("Precise location proven?", f"pin_precise_{idx}")
+
+        result_ui_rows.append({
+            "name": name, "address": address, "classification": classification,
+            "result_type": result_type, "status": status,
+            "mode": result_mode, "geocode_addr": result_geocode_addr,
+            "lat": result_lat, "lon": result_lon,
+            "official_name": official_name, "official_address": official_address,
+            "usps": usps_data,
+            "pin_boundary_identifiable": pin_boundary_identifiable,
+            "pin_same_property": pin_same_property,
+            "pin_same_block": pin_same_block,
+            "pin_adjacent_property": pin_adjacent_property,
+            "pin_precise": pin_precise,
+        })
 
 
-if "blurb" in st.session_state and st.session_state["blurb"]:
-    st.markdown(
-        f"<div class='blurb-box'>{st.session_state['blurb']}</div>",
-        unsafe_allow_html=True,
+# ─────────────────────────────────────────────────────────────────────────────
+# Resolve coordinates
+# ─────────────────────────────────────────────────────────────────────────────
+resolved_vp_lat,   resolved_vp_lon,   resolved_vp_disp   = resolve_location(
+    "viewport", vp_mode, vp_address, vp_lat, vp_lon)
+resolved_user_lat, resolved_user_lon, resolved_user_disp = resolve_location(
+    "user", user_mode, user_address, user_lat, user_lon)
+
+# Viewport bbox (used for inside/outside check)
+vp_bbox: Optional[dict] = None
+
+resolved_results: list[dict] = []
+for r in result_ui_rows:
+    rr_lat, rr_lon, rr_disp = resolve_location(
+        "result", r["mode"], r["geocode_addr"], r["lat"], r["lon"]
     )
-    st.caption("Select all text in the box above to copy it.")
-else:
-    st.markdown(
-        "<div style='color:#4b5563;font-size:13px'>Fill in the sidebar fields and click "
-        "<b>⚡ Generate Context Blurb</b>.</div>",
-        unsafe_allow_html=True,
-    )
+    row = dict(r)
+    row.update(resolved_lat=rr_lat, resolved_lon=rr_lon, resolved_disp=rr_disp)
+
+    # Distance
+    if rr_lat is not None and rr_lon is not None:
+        if resolved_user_lat is not None:
+            row["distance_to_user_km"] = haversine_km(
+                resolved_user_lat, resolved_user_lon, rr_lat, rr_lon)
+        else:
+            row["distance_to_user_km"] = None
+
+        if resolved_vp_lat is not None:
+            row["distance_to_viewport_km"] = haversine_km(
+                resolved_vp_lat, resolved_vp_lon, rr_lat, rr_lon)
+        else:
+            row["distance_to_viewport_km"] = None
+    else:
+        row["distance_to_user_km"]     = None
+        row["distance_to_viewport_km"] = None
+
+    row["inside_viewport_rect"] = None  # computed below after bbox is known
+    resolved_results.append(row)
 
 
-# ─── Footer ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Resolved inputs summary
+# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown("""
-<div style='font-size:11px;color:#374151;text-align:center'>
-TELUS Maps Study Aid · For exam preparation use only ·
-<a href='https://tools.usps.com/zip-code-lookup.htm?byaddress' target='_blank' style='color:#475569'>USPS Address Verify</a> ·
-<a href='https://maps.google.com' target='_blank' style='color:#475569'>Google Maps</a>
-</div>
-""", unsafe_allow_html=True)
+st.subheader("Resolved Inputs")
+
+r1, r2, r3, r4 = st.columns(4)
+r1.markdown(f"**Query**\n\n`{query or '—'}`")
+r2.markdown(f"**Viewport Age**\n\n`{viewport_age}`")
+r3.markdown(f"**Locale**\n\n`{locale}`")
+r4.markdown(f"**Country**\n\n`{country}`")
+
+r5, r6 = st.columns(2)
+r5.markdown(
+    f"**Viewport**  \n`{resolved_vp_lat}, {resolved_vp_lon}`  \n"
+    f"<span class='small-muted'>{resolved_vp_disp or '—'}</span>",
+    unsafe_allow_html=True,
+)
+r6.markdown(
+    f"**User**  \n`{resolved_user_lat}, {resolved_user_lon}`  \n"
+    f"<span class='small-muted'>{resolved_user_disp or '—'}</span>",
+    unsafe_allow_html=True,
+)
+
+rc1, rc2 = st.columns(2)
+with rc1:
+    render_location_links("Viewport", resolved_vp_lat, resolved_vp_lon, vp_address or resolved_vp_disp or "")
+with rc2:
+    render_location_links("User", resolved_user_lat, resolved_user_lon, user_address or resolved_user_disp or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Map
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("Map")
+
+has_any_coords = (
+    resolved_vp_lat is not None
+    or resolved_user_lat is not None
+    or any(r.get("resolved_lat") is not None for r in resolved_results)
+)
+
+if render_map_btn or has_any_coords:
+    all_lats = [x for x in [resolved_vp_lat, resolved_user_lat] if x is not None]
+    all_lons = [x for x in [resolved_vp_lon, resolved_user_lon] if x is not None]
+    for r in resolved_results:
+        if r.get("resolved_lat") is not None:
+            all_lats.append(r["resolved_lat"])
+            all_lons.append(r["resolved_lon"])
+
+    if not all_lats:
+        st.info("No mappable coordinates yet.")
+    else:
+        center_lat = sum(all_lats) / len(all_lats)
+        center_lon = sum(all_lons) / len(all_lons)
+
+        m = folium.Map(location=(center_lat, center_lon), zoom_start=11, tiles="CartoDB dark_matter")
+
+        # Viewport rectangle
+        if resolved_vp_lat is not None:
+            vp_color = "#3b82f6" if viewport_age == "FRESH" else "#f59e0b"
+            vp_bbox = add_viewport_rectangle(
+                m, resolved_vp_lat, resolved_vp_lon,
+                vp_width_m, vp_height_m, vp_color,
+            )
+            folium.Marker(
+                [resolved_vp_lat, resolved_vp_lon],
+                popup=f"Viewport ({resolved_vp_lat:.4f}, {resolved_vp_lon:.4f})",
+                tooltip="📺 Viewport Center",
+                icon=folium.Icon(
+                    color="blue" if viewport_age == "FRESH" else "orange",
+                    icon="tv", prefix="fa",
+                ),
+            ).add_to(m)
+
+        # User
+        if resolved_user_lat is not None:
+            folium.Marker(
+                [resolved_user_lat, resolved_user_lon],
+                popup=f"User ({resolved_user_lat:.4f}, {resolved_user_lon:.4f})",
+                tooltip="👤 User Location",
+                icon=folium.Icon(color="green", icon="user", prefix="fa"),
+            ).add_to(m)
+
+        # Results + viewport inside check
+        pin_colors = ["red", "purple", "darkred", "cadetblue", "darkblue", "pink"]
+        for i, row in enumerate(resolved_results):
+            if vp_bbox and row.get("resolved_lat") is not None:
+                row["inside_viewport_rect"] = point_in_bbox(
+                    row["resolved_lat"], row["resolved_lon"],
+                    vp_bbox["south"], vp_bbox["north"],
+                    vp_bbox["west"],  vp_bbox["east"],
+                )
+
+            if row.get("resolved_lat") is not None:
+                closed_str = (
+                    '<br><b style="color:red">⚠ CLOSED/DNE</b>'
+                    if "clos" in row.get("status", "").lower() else ""
+                )
+                folium.Marker(
+                    [row["resolved_lat"], row["resolved_lon"]],
+                    popup=folium.Popup(
+                        f"<b>{row.get('name') or f'Result {i+1}'}</b><br>"
+                        f"{row.get('address','')}<br>"
+                        f"<i>{row.get('classification','')}</i>{closed_str}",
+                        max_width=200,
+                    ),
+                    tooltip=f"📍 Result {i+1}: {row.get('name') or 'unnamed'}",
+                    icon=folium.Icon(
+                        color=pin_colors[i % len(pin_colors)],
+                        icon="map-marker", prefix="fa",
+                    ),
+                ).add_to(m)
+                if resolved_user_lat is not None:
+                    folium.PolyLine(
+                        [[resolved_user_lat, resolved_user_lon],
+                         [row["resolved_lat"], row["resolved_lon"]]],
+                        color="#ef4444" if i == 0 else "#a78bfa",
+                        weight=1.5, opacity=0.5, dash_array="5",
+                    ).add_to(m)
+
+        st_folium(m, width=None, height=480, returned_objects=[])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("Evaluation")
+
+if evaluate_btn:
+    if not query.strip():
+        st.error("Please enter a query.")
+    else:
+        query_ctx = QueryContext(
+            query=query,
+            viewport_age=viewport_age,
+            locale=locale,
+            country=country,
+            user_lat=resolved_user_lat,
+            user_lon=resolved_user_lon,
+            viewport_lat=resolved_vp_lat,
+            viewport_lon=resolved_vp_lon,
+            user_inside_viewport=user_inside_viewport_map[user_inside_viewport_label],
+        )
+
+        engine_results = [build_result_input_from_ui(r) for r in resolved_results]
+        decisions      = [score_result(query_ctx, r, engine_results) for r in engine_results]
+
+        # ── Query-level banner ─────────────────────────────────────────────
+        if decisions:
+            nav = decisions[0].has_navigational_result
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e2e8f0;border-radius:10px;
+                            padding:12px 16px;background:#606060;margin-bottom:12px">
+                    <b>Is there a navigational result for this query?</b>
+                    <span class="code-ish" style="margin-left:12px">
+                        {'✅ Yes' if nav else '❌ No'}
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # ── Distance ranking helper ────────────────────────────────────────
+        dist_rows = [
+            (i, r.get("name") or f"Result {i}", r.get("distance_to_user_km"))
+            for i, r in enumerate(resolved_results, 1)
+            if r.get("distance_to_user_km") is not None
+        ]
+        if dist_rows:
+            dist_rows.sort(key=lambda x: x[2])
+            st.markdown("#### Distance to User Ranking")
+            for rank, (ri, nm, dkm) in enumerate(dist_rows, 1):
+                st.write(f"#{rank} — Result {ri} ({nm}) — {dkm:.2f} km")
+
+        # ── Per-result decisions ───────────────────────────────────────────
+        st.markdown("#### Per-Result Decisions")
+
+        for i, (ui_row, decision) in enumerate(zip(resolved_results, decisions), 1):
+            with st.container():
+                st.markdown(f"### Result {i}: {ui_row.get('name') or f'Result {i}'}")
+
+                inside_rect = ui_row.get("inside_viewport_rect")
+                st.write(f"**Inside viewport rectangle?** {format_bool(inside_rect)}")
+
+                render_location_links(
+                    f"Result {i}",
+                    ui_row.get("resolved_lat"),
+                    ui_row.get("resolved_lon"),
+                    ui_row.get("address") or ui_row.get("resolved_disp") or "",
+                )
+
+                st.markdown("<div class='decision-box'>", unsafe_allow_html=True)
+
+                # Rating summary row
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.markdown(
+                    f"**Relevance**<br>{_relevance_badge(decision.relevance)}",
+                    unsafe_allow_html=True,
+                )
+                sc2.write(f"**Name** {decision.name_rating}")
+                sc3.write(f"**Address** {decision.address_rating}")
+                sc4.write(f"**Pin** {decision.pin_rating}")
+
+                # Flags row
+                ff1, ff2, ff3 = st.columns(3)
+                ff1.write(
+                    f"**Unexpected language?** "
+                    f"{'🚫 Yes' if decision.unexpected_language_or_script else 'No'}"
+                )
+                ff2.write(
+                    f"**Closed / DNE?** "
+                    f"{'⚠️ Yes' if decision.business_closed_or_dne else 'No'}"
+                )
+                ff3.write(
+                    f"**Demotion:** "
+                    f"{', '.join(decision.demotion_reasons) if decision.demotion_reasons else '—'}"
+                )
+
+                if decision.address_issues:
+                    st.info(f"Address issue(s): {', '.join(decision.address_issues)}")
+                if decision.relevance_notes:
+                    with st.expander("Relevance reasoning", expanded=False):
+                        for note in decision.relevance_notes:
+                            st.write(note)
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # ── Assumption flags (the star of the show) ────────────────
+                st.markdown("##### 🔍 Assumptions to Investigate")
+                render_assumption_flags(decision.assumption_flags)
+
+                # ── Generated blurb ────────────────────────────────────────
+                blurb = decision_to_blurb(ui_row.get("name", ""), decision, query=query)
+                st.text_area(
+                    f"Generated Comment / Blurb — Result {i}",
+                    value=blurb,
+                    height=220,
+                    key=f"result_blurb_{i}",
+                )
+
+                st.divider()
